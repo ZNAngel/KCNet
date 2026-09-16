@@ -1,25 +1,24 @@
 import os
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-import pandas as pd
+from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer, Callback
+from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import f1_score
 from module.KCNet import GraphKANFusion
-from datasets.CRC100K import collate_fn_masked, crc100k_dataloader
+from module.losses import KCNetObjective
+from datasets.CRC100K import LABEL_TO_ID, collate_fn_masked, crc100k_dataloader
 
 # --------------------------
 # --- Configuration ---
 # --------------------------
 
-NUM_CLASSES = 16
+NUM_CLASSES = len(LABEL_TO_ID)
+# Existing example-run settings; this methods-only update does not reproduce
+# the manuscript's experimental sampling / optimization protocol.
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 200
@@ -34,75 +33,22 @@ LOG_NAME = 'CRC100K7K'
 # --------------------------
 
 class GraphFusionModule(pl.LightningModule):
-    def __init__(self, model):
+    def __init__(self, model, *, alpha_aux=0.3, alpha_orth=0.3, alpha_con=0.3, lambda_sp=1e-4):
         super().__init__()
         self.model = model
         self.criterion = nn.CrossEntropyLoss()
-
-        # Simplified weights
-        self.w_aux = 0.3
-        self.w_orth = 0.3
-        self.w_con = 0.3
-
+        self.objective = KCNetObjective(alpha_aux, alpha_orth, alpha_con, lambda_sp)
+        self.save_hyperparameters(ignore=['model'])
         self.validation_step_outputs = []
-
-    def compute_orthogonal_loss(self, shared_list, private_list):
-        loss = 0.0
-        count = 0
-        for s, p in zip(shared_list, private_list):
-            s_flat = s.contiguous().view(-1, s.shape[-1])
-            p_flat = p.contiguous().view(-1, p.shape[-1])
-            num_samples = min(2000, s_flat.size(0))
-            if num_samples > 0:
-                idx = torch.randperm(s_flat.size(0))[:num_samples]
-                sim = F.cosine_similarity(s_flat[idx], p_flat[idx], dim=-1)
-                loss += torch.abs(sim).mean()
-                count += 1
-        return loss / max(count, 1)
-
-    def compute_infonce_loss(self, feat_a, feat_b, temperature=0.5):
-        batch_size = feat_a.shape[0]
-        feat_a = F.normalize(feat_a, dim=1)
-        feat_b = F.normalize(feat_b, dim=1)
-        logits = torch.matmul(feat_a, feat_b.T) / temperature
-        labels = torch.arange(batch_size).to(feat_a.device)
-        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
 
     def training_step(self, batch, batch_idx):
         features, labels = batch
         if features is None: return None
 
-        final_logits, expert_logits, logits_correction, \
-        shared_list, private_list, shared_pool_list = self.model(features)
-
-        # 1. Main Loss
-        loss_main = self.criterion(final_logits, labels)
-
-        # 2. Aux Loss
-        loss_aux = 0
-        for logits in expert_logits:
-            loss_aux += self.criterion(logits, labels)
-
-        # 3. Regularization
-        loss_orth = self.compute_orthogonal_loss(shared_list, private_list)
-
-        loss_con = 0
-        s_v, s_u, s_h = shared_pool_list
-        loss_con += self.compute_infonce_loss(s_v, s_u)
-        loss_con += self.compute_infonce_loss(s_u, s_h)
-        loss_con += self.compute_infonce_loss(s_v, s_h)
-        loss_con = loss_con / 3.0
-
-        # 4. Sparsity Penalty on Correction (Optional)
-        # We want the council to only intervene when necessary, not override everything.
-        loss_sparsity = torch.norm(logits_correction, p=1) * 1e-4
-
-        # Total
-        loss = loss_main + \
-               self.w_aux * loss_aux + \
-               self.w_orth * loss_orth + \
-               self.w_con * loss_con + \
-               loss_sparsity
+        outputs = self.model(features)
+        final_logits, _, logits_correction, _, _, _ = outputs
+        losses = self.objective(self.model, outputs, labels, self.model.get_masks(features))
+        loss = losses['total']
 
         # Logging
         preds = final_logits.argmax(dim=1)
@@ -110,7 +56,8 @@ class GraphFusionModule(pl.LightningModule):
 
         self.log('train_loss', loss, prog_bar=True)
         self.log('train_acc', acc, prog_bar=True)
-        # Monitor how much the council is "speaking up"
+        for name in ('main', 'aux', 'orth', 'con', 'sparsity'):
+            self.log(f'train_{name}', losses[name])
         self.log('correction_mag', logits_correction.abs().mean())
 
         return loss
@@ -120,6 +67,7 @@ class GraphFusionModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         features, labels = batch
+        if features is None: return None
         final_logits, _, _, _, _, _ = self.model(features)
         loss = self.criterion(final_logits, labels)
         preds = final_logits.argmax(dim=1)
@@ -141,7 +89,7 @@ class GraphFusionModule(pl.LightningModule):
         return optim.AdamW(self.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
 
 def run_training():
-    print("\n=== Launching Training: Residual Council Fusion (Stable) ===")
+    print("\n=== Launching Training: KCNet (CFC + GFR + RCF) ===")
     model = GraphKANFusion(num_classes=NUM_CLASSES)
     pl_module = GraphFusionModule(model)
 
